@@ -300,7 +300,7 @@ void textFileBrowser(file_handle** directory, int num_files)
   
 	while(1){
 		drawFiles(directory, num_files);
-		while ((PAD_StickY(0) > -16 && PAD_StickY(0) < 16) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_B) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_A) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_UP) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_DOWN))
+		while ((PAD_StickY(0) > -16 && PAD_StickY(0) < 16) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_B) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_A) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_UP) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_DOWN) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_START))
 			{ VIDEO_WaitVSync (); }
 		if((PAD_ButtonsHeld(0) & PAD_BUTTON_UP) || PAD_StickY(0) > 16){	curSelection = (--curSelection < 0) ? num_files-1 : curSelection;}
 		if((PAD_ButtonsHeld(0) & PAD_BUTTON_DOWN) || PAD_StickY(0) < -16) {curSelection = (curSelection + 1) % num_files;	}
@@ -335,7 +335,12 @@ void textFileBrowser(file_handle** directory, int num_files)
 			return;
 		}
 		
-		if(PAD_ButtonsHeld(0) & PAD_BUTTON_B)	{
+		if (PAD_ButtonsHeld(0) & PAD_BUTTON_START)	{
+			dump_ipl();
+			return;
+		}
+
+		if (PAD_ButtonsHeld(0) & PAD_BUTTON_B)	{
 			memcpy(&curFile, &(*directory)[curSelection], sizeof(file_handle));
 			curMenuLocation=ON_OPTIONS;
 			return;
@@ -344,7 +349,7 @@ void textFileBrowser(file_handle** directory, int num_files)
 			usleep((abs(PAD_StickY(0)) > 64 ? 50000:100000) - abs(PAD_StickY(0)*64));
 		}
 		else {
-			while (!(!(PAD_ButtonsHeld(0) & PAD_BUTTON_B) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_A) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_UP) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_DOWN)))
+			while (!(!(PAD_ButtonsHeld(0) & PAD_BUTTON_B) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_A) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_UP) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_DOWN) && !(PAD_ButtonsHeld(0) & PAD_BUTTON_START)))
 				{ VIDEO_WaitVSync (); }
 		}
 	}
@@ -892,6 +897,125 @@ void manage_file() {
 		DrawMessageBox(D_INFO,"Directory support not implemented");
 		DrawFrameFinish();
 	}
+}
+
+/* Dump IPL file  - The user will be asked where they want to dump the IPL*/
+void dump_ipl() {
+		// Ask the user what they want to do with it
+		DrawFrameStart();
+		DrawEmptyBox(10, 150, vmode->fbWidth - 10, 350, COLOR_BLACK);
+		WriteFontStyled(640 / 2, 160, "Dump IPL:", 1.0f, true, defaultColor);
+		float scale = GetTextScaleToFitInWidth("ipl.bin", vmode->fbWidth - 10 - 10);
+		WriteFontStyled(640 / 2, 200, "ipl.bin", scale, true, defaultColor);
+		WriteFontStyled(640 / 2, 230, "(A) Dump", 1.0f, true, defaultColor);
+		WriteFontStyled(640 / 2, 300, "Press an option to Continue, or B to return", 1.0f, true, defaultColor);
+		DrawFrameFinish();
+		while (PAD_ButtonsHeld(0) & PAD_BUTTON_A) { VIDEO_WaitVSync(); }
+		int option = 0;
+		while (1) {
+			u32 buttons = PAD_ButtonsHeld(0);
+			if (buttons & PAD_BUTTON_A) {
+				option = COPY_OPTION;
+				while (PAD_ButtonsHeld(0) & PAD_BUTTON_A){ VIDEO_WaitVSync(); }
+				break;
+			}
+			if (buttons & PAD_BUTTON_B) {
+				return;
+			}
+		}
+
+		// If dump, ask which device is the destination device and dump
+		if (option == COPY_OPTION) {
+			int ret = 0;
+			// Show a list of destination devices (the same device is also a possibility)
+			select_copy_device();
+			// If the devices are not the same, init the second, fail on non-existing device/etc
+			if (deviceHandler_initial != deviceHandler_dest_initial) {
+				deviceHandler_dest_deinit(deviceHandler_dest_initial);
+				ret = deviceHandler_dest_init(deviceHandler_dest_initial);
+				if (!ret) {
+					DrawFrameStart();
+					sprintf(txtbuffer, "Failed to init destination device! (%i)", ret);
+					DrawMessageBox(D_FAIL, txtbuffer);
+					DrawFrameFinish();
+					wait_press_A();
+					return;
+				}
+			}
+			// Traverse this destination device and let the user select a directory to dump the file in
+			file_handle *destFile = memalign(32, sizeof(file_handle));
+
+			// Show a directory only browser and get the destination file location
+			select_dest_dir(deviceHandler_dest_initial, destFile);
+			destFile->fp = 0;
+			destFile->fileBase = 0;
+			destFile->size = 0;
+			destFile->fileAttrib = IS_FILE;
+			destFile->status = 0;
+			destFile->offset = 0;
+
+			{
+				sprintf(destFile->name, "%s/%s", destFile->name, "ipl.bin");
+
+				u32 isDestCard = deviceHandler_dest_writeFile == deviceHandler_CARD_writeFile;
+				if (isDestCard && strstr(destFile->name, ".gci") == NULL && strstr(destFile->name, ".GCI") == NULL) {
+					// Only .GCI files can go to the memcard
+					DrawFrameStart();
+					DrawMessageBox(D_INFO, "Only GCI files allowed on memcard. Press A to continue");
+					DrawFrameFinish();
+					wait_press_A();
+					return;
+				}
+
+				// Read from one file and write to the new directory
+				u32 curOffset = 0, cancelled = 0, chunkSize = (2*1024);
+				char *readBuffer = (char*)memalign(32, chunkSize);
+
+				while (curOffset < (2 * 1024 * 1024)) {
+					u32 buttons = PAD_ButtonsHeld(0);
+					if (buttons & PAD_BUTTON_B) {
+						cancelled = 1;
+						break;
+					}
+					sprintf(txtbuffer, "Dumping to: %s", getRelativeName(destFile->name));
+					DrawFrameStart();
+					DrawProgressBar((int)((float)((float)curOffset / (float)(2 * 1024 * 1024)) * 100), txtbuffer);
+					DrawFrameFinish();
+					u32 amountToCopy = curOffset + chunkSize >(2 * 1024 * 1024) ? (2 * 1024 * 1024) - curOffset : chunkSize;
+					__SYS_ReadROM(readBuffer, amountToCopy, curOffset);
+					ret = amountToCopy;
+					if (ret != amountToCopy) {
+						DrawFrameStart();
+						sprintf(txtbuffer, "Failed to Read! (%i %i)", amountToCopy, ret);
+						DrawMessageBox(D_FAIL, txtbuffer);
+						DrawFrameFinish();
+						wait_press_A();
+						return;
+					}
+					ret = deviceHandler_dest_writeFile(destFile, readBuffer, amountToCopy);
+					if (ret != amountToCopy) {
+						DrawFrameStart();
+						sprintf(txtbuffer, "Failed to Write! (%i %i)", amountToCopy, ret);
+						DrawMessageBox(D_FAIL, txtbuffer);
+						DrawFrameFinish();
+						wait_press_A();
+						return;
+					}
+					curOffset += amountToCopy;
+				}
+				deviceHandler_dest_deinit(destFile);
+				free(destFile);
+				DrawFrameStart();
+				if (!cancelled) {
+						DrawMessageBox(D_INFO, "Dump Complete! Press A to continue");
+				}
+				else {
+					DrawMessageBox(D_INFO, "Operation Cancelled! Press A to continue");
+				}
+				DrawFrameFinish();
+				wait_press_A();
+			}
+		}
 }
 
 /* Execute/Load/Parse the currently selected file */
